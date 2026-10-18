@@ -31,7 +31,23 @@ const BODY_REWRITE_HEADERS_TO_DROP = ["content-length", "content-md5", "etag"];
 
 export default {
   async fetch(request, env) {
-    const target = resolveTarget(env);
+    let target;
+    try {
+      target = resolveTarget(env);
+    } catch (error) {
+      console.error("TARGET_ORIGIN 配置无效", {
+        value: env?.TARGET_ORIGIN,
+        error: error instanceof Error ? error.message : String(error),
+      });
+
+      return new Response("500 Internal Server Error: 上游地址配置无效", {
+        status: 500,
+        headers: {
+          "content-type": "text/plain; charset=utf-8",
+        },
+      });
+    }
+
     const proxyUrl = new URL(request.url);
     const upstreamUrl = new URL(request.url);
     upstreamUrl.protocol = target.url.protocol;
@@ -105,6 +121,11 @@ export default {
 function resolveTarget(env) {
   const raw = env?.TARGET_ORIGIN || DEFAULT_TARGET_ORIGIN;
   const url = new URL(raw);
+
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`不支持的协议: ${url.protocol}`);
+  }
+
   return { url, origin: url.origin, host: url.host };
 }
 
@@ -116,7 +137,13 @@ function buildUpstreamHeaders(request, proxyUrl, target) {
   }
 
   headers.set("host", target.host);
-  headers.set("accept-encoding", "identity");
+
+  // 只有可能返回 HTML 的请求才需要禁止压缩，因为 body 要按文本改写。
+  // 其余请求（JS / CSS / 字体 / 图片）透传客户端的 accept-encoding，
+  // 避免为了改写文档而牺牲全部静态资源的压缩传输。
+  if (mayReturnHtml(request)) {
+    headers.set("accept-encoding", "identity");
+  }
 
   const referer = headers.get("referer");
   if (referer) {
@@ -129,6 +156,18 @@ function buildUpstreamHeaders(request, proxyUrl, target) {
   }
 
   return headers;
+}
+
+function mayReturnHtml(request) {
+  // Sec-Fetch-Dest 由浏览器自动带上，比 Accept 更精确：
+  // 导航请求为 document，iframe 为 iframe，静态资源为 image / style / script 等。
+  const destination = request.headers.get("sec-fetch-dest");
+  if (destination) {
+    return destination === "document" || destination === "iframe" || destination === "frame";
+  }
+
+  const accept = request.headers.get("accept") || "";
+  return accept.includes("text/html") || accept.includes("application/xhtml");
 }
 
 function buildResponseHeaders(response, proxyUrl, target) {
@@ -144,6 +183,9 @@ function buildResponseHeaders(response, proxyUrl, target) {
   rewriteHeader(headers, "refresh", proxyUrl, target);
   rewriteHeader(headers, "content-security-policy", proxyUrl, target);
   rewriteHeader(headers, "content-security-policy-report-only", proxyUrl, target);
+  // 带 crossorigin 的 <script integrity> 会走 CORS 校验，
+  // 回显上游域名的 ACAO 会让这些资源被浏览器拒绝。
+  rewriteHeader(headers, "access-control-allow-origin", proxyUrl, target);
   rewriteSetCookieHeaders(response.headers, headers);
 
   return headers;
@@ -243,32 +285,52 @@ function rewriteHtmlBody(body, proxyUrl, target, charset) {
 
 function createStreamingReferenceRewriter(proxyUrl, target) {
   const replacements = getTargetToProxyReplacements(proxyUrl, target);
+  const replacementByNeedle = new Map(replacements);
   const maxNeedleLength = Math.max(...replacements.map(([needle]) => needle.length));
 
+  // 用单个正则一次扫描代替逐字符 startsWith：
+  // 前者由引擎实现，后者在 1MB 页面上要多花一个数量级的 CPU。
+  const pattern = new RegExp(
+    replacements.map(([needle]) => escapeRegExp(needle)).join("|"),
+    "g",
+  );
+
   return (value, isFinal) => {
-    const safeEnd = isFinal
+    // 末尾 maxNeedleLength - 1 个字符可能是被切断的匹配，留给下一块拼接
+    const cut = isFinal
       ? value.length
       : Math.max(0, value.length - maxNeedleLength + 1);
-    let output = "";
-    let index = 0;
 
-    while (index < safeEnd) {
-      const replacement = replacements.find(([needle]) => value.startsWith(needle, index));
-      if (replacement) {
-        output += replacement[1];
-        index += replacement[0].length;
-        continue;
+    let output = "";
+    let last = 0;
+    let match;
+
+    pattern.lastIndex = 0;
+    while ((match = pattern.exec(value)) !== null) {
+      if (match.index >= cut) {
+        break;
       }
 
-      output += value[index];
-      index += 1;
+      output += value.slice(last, match.index) + replacementByNeedle.get(match[0]);
+      last = match.index + match[0].length;
     }
+
+    const consumed = Math.max(last, cut);
+    output += value.slice(last, consumed);
 
     return {
       output,
-      carry: value.slice(index),
+      carry: value.slice(consumed),
     };
   };
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function escapeSlashes(value) {
+  return value.replaceAll("/", "\\/");
 }
 
 function rewriteTargetReferencesToProxy(value, proxyUrl, target) {
@@ -279,17 +341,30 @@ function rewriteTargetReferencesToProxy(value, proxyUrl, target) {
 }
 
 function getTargetToProxyReplacements(proxyUrl, target) {
-  // 按长度降序，保证 https://host 先于 //host 命中，不依赖数组书写顺序
-  return [
-    [target.origin, proxyUrl.origin],
-    [`http://${target.host}`, proxyUrl.origin],
-    [`//${target.host}`, `//${proxyUrl.host}`],
-  ].sort((a, b) => b[0].length - a[0].length);
+  const proxyOrigin = proxyUrl.origin;
+  const proxyHost = proxyUrl.host;
+
+  const replacements = [
+    [target.origin, proxyOrigin],
+    [`http://${target.host}`, proxyOrigin],
+    [`//${target.host}`, `//${proxyHost}`],
+    // 页面内联的 JSON / JS 常把斜杠转义成 \/，不处理会导致这些地址漏改
+    [escapeSlashes(target.origin), escapeSlashes(proxyOrigin)],
+    [`http:\\/\\/${target.host}`, escapeSlashes(proxyOrigin)],
+    [`\\/\\/${target.host}`, `\\/\\/${proxyHost}`],
+  ];
+
+  // 长 needle 优先，保证 https://host 不会被 //host 抢先匹配
+  return replacements.sort((a, b) => b[0].length - a[0].length);
 }
 
 function rewriteProxyReferencesToTarget(value, proxyUrl, target) {
-  return value
-    .replaceAll(proxyUrl.origin, target.origin)
-    .replaceAll(`http://${proxyUrl.host}`, target.origin)
-    .replaceAll(`//${proxyUrl.host}`, `//${target.host}`);
+  const replacements = getTargetToProxyReplacements(proxyUrl, target)
+    .map(([needle, replacement]) => [replacement, needle])
+    .sort((a, b) => b[0].length - a[0].length);
+
+  return replacements.reduce(
+    (rewritten, [needle, replacement]) => rewritten.replaceAll(needle, replacement),
+    value,
+  );
 }

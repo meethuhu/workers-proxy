@@ -1,0 +1,15 @@
+{
+  "name": "workers-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Workers 反向代理：转发请求至固定上游并改写 HTML 中的绝对地址",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --test"
+  }
+}
