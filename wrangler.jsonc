@@ -1,0 +1,20 @@
+{
+  // 部署入口。wrangler deploy 直接使用源码，无构建步骤。
+  "name": "workers-proxy",
+  "main": "worker.js",
+
+  // 固定运行时行为。不写这一项时，wrangler 会用部署当天日期，
+  // 导致同一份代码在不同时间部署表现出不同语义。
+  "compatibility_date": "2026-10-01",
+
+  // 上游地址放在 vars 里，改目标只需改配置并重新部署，不必动代码。
+  // 代码中未配置时回退到 worker.js 内的 DEFAULT_TARGET_ORIGIN。
+  "vars": {
+    "TARGET_ORIGIN": "https://spring.io"
+  },
+
+  // 打开后可对 console.error 产生的日志做检索，便于排查 502。
+  "observability": {
+    "enabled": true
+  }
+}
