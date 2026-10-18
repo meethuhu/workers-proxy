@@ -58,15 +58,28 @@ export default {
       method: request.method,
       headers: buildUpstreamHeaders(request, proxyUrl, target),
       redirect: "manual",
-      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
     };
 
     if (request.method !== "GET" && request.method !== "HEAD") {
       upstreamRequestInit.body = request.body;
     }
 
+    // 超时只约束「等待响应头」这一段。若用 AbortSignal.timeout，
+    // 计时器会一直活到请求结束，25s 时把仍在传输的响应体一起中断，
+    // 大文件下载会在中途失败。因此拿到响应头后立刻清除计时器。
+    const controller = new AbortController();
+    let timedOut = false;
+    const timeoutId = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, target.timeoutMs);
+
     try {
-      const response = await fetch(upstreamUrl, upstreamRequestInit);
+      const response = await fetch(upstreamUrl, {
+        ...upstreamRequestInit,
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
       const responseHeaders = buildResponseHeaders(response, proxyUrl, target);
       const contentType = responseHeaders.get("content-type") || "";
 
@@ -75,7 +88,8 @@ export default {
       if (
         isHtmlResponse(contentType) &&
         response.body &&
-        isIdentityEncoding(responseHeaders.get("content-encoding"))
+        isIdentityEncoding(responseHeaders.get("content-encoding")) &&
+        !isPartialContent(response)
       ) {
         for (const header of BODY_REWRITE_HEADERS_TO_DROP) {
           responseHeaders.delete(header);
@@ -101,10 +115,13 @@ export default {
         headers: responseHeaders,
       });
     } catch (error) {
+      clearTimeout(timeoutId);
+
       // 详细原因只写日志，不回传客户端，避免泄漏上游地址与网络错误细节。
       console.error("上游请求失败", {
         url: upstreamUrl.href,
         method: request.method,
+        timedOut,
         error: error instanceof Error ? error.message : String(error),
       });
 
@@ -126,7 +143,12 @@ function resolveTarget(env) {
     throw new Error(`不支持的协议: ${url.protocol}`);
   }
 
-  return { url, origin: url.origin, host: url.host };
+  // 可选：env.UPSTREAM_TIMEOUT_MS 覆盖等待响应头的超时（默认 25s）
+  const configured = Number(env?.UPSTREAM_TIMEOUT_MS);
+  const timeoutMs =
+    Number.isFinite(configured) && configured > 0 ? configured : UPSTREAM_TIMEOUT_MS;
+
+  return { url, origin: url.origin, host: url.host, timeoutMs };
 }
 
 function buildUpstreamHeaders(request, proxyUrl, target) {
@@ -235,6 +257,12 @@ function isIdentityEncoding(contentEncoding) {
     return true;
   }
   return contentEncoding.trim().toLowerCase() === "identity";
+}
+
+function isPartialContent(response) {
+  // 206 的 body 只是完整资源的一段切片，按文本改写会破坏 Content-Range
+  // 描述的字节区间，因此分段响应一律原样透传。
+  return response.status === 206 || response.headers.has("content-range");
 }
 
 function getCharset(contentType) {

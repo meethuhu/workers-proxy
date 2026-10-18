@@ -1,5 +1,6 @@
 import { test, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
+import http from "node:http";
 import { gzipSync } from "node:zlib";
 import worker from "../worker.js";
 
@@ -234,4 +235,113 @@ test("env.TARGET_ORIGIN 覆盖默认上游", async () => {
 
   assert.equal(new URL(captured.url).host, "other.example.com");
   assert.ok(text.includes(`${PROXY_ORIGIN}/x`), "覆盖上游后地址未按新上游改写");
+});
+
+test("206 分段响应不做 HTML 改写", async () => {
+  const partial = `<a href="${UPSTREAM_ORIGIN}/x">`;
+  mockUpstream(
+    () =>
+      new Response(partial, {
+        status: 206,
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "content-range": "bytes 0-24/1000",
+        },
+      }),
+  );
+
+  const res = await worker.fetch(proxyRequest("/", { range: "bytes=0-24" }), {});
+
+  assert.equal(res.status, 206);
+  assert.equal(await res.text(), partial, "分段响应被改写了");
+});
+
+test("大体积二进制响应逐字节透传", async () => {
+  const bytes = new Uint8Array(2 * 1024 * 1024);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = i % 251;
+  }
+
+  mockUpstream(
+    () =>
+      new Response(bytes, {
+        headers: { "content-type": "application/octet-stream", "content-length": String(bytes.length) },
+      }),
+  );
+
+  const res = await worker.fetch(proxyRequest("/download.bin"), {});
+  const body = new Uint8Array(await res.arrayBuffer());
+
+  assert.equal(body.length, bytes.length);
+  assert.deepEqual(body, bytes, "二进制内容被改动");
+  assert.equal(res.headers.get("content-length"), String(bytes.length));
+});
+
+test("拿到响应头后清除超时计时器，避免中断仍在传输的 body", async () => {
+  mockUpstream(() => new Response("ok", { headers: { "content-type": "text/plain" } }));
+
+  const originalClear = globalThis.clearTimeout;
+  const spy = mock.method(globalThis, "clearTimeout", (id) => originalClear(id));
+
+  await worker.fetch(proxyRequest("/"), {});
+
+  assert.ok(spy.mock.callCount() >= 1, "响应头返回后未清除超时计时器");
+});
+
+function listen(handler) {
+  return new Promise((resolve) => {
+    const server = http.createServer(handler);
+    server.listen(0, "127.0.0.1", () => resolve(server));
+  });
+}
+
+function closeServer(server) {
+  server.closeAllConnections();
+  return new Promise((resolve) => server.close(resolve));
+}
+
+test("上游响应头返回后，慢速 body 仍能完整传输", async () => {
+  // 响应头立刻返回，body 需要 600ms 才传完
+  const server = await listen((req, res) => {
+    res.writeHead(200, { "content-type": "application/octet-stream" });
+    res.write("start");
+    const timer = setInterval(() => res.write("x"), 60);
+    setTimeout(() => {
+      clearInterval(timer);
+      res.end("done");
+    }, 600);
+  });
+
+  try {
+    globalThis.fetch = originalFetch;
+    const res = await worker.fetch(proxyRequest("/download.bin"), {
+      TARGET_ORIGIN: `http://127.0.0.1:${server.address().port}`,
+      UPSTREAM_TIMEOUT_MS: "100", // 远小于 body 传输耗时
+    });
+
+    const text = await res.text();
+    assert.ok(text.startsWith("start"), "body 起始内容丢失");
+    assert.ok(text.endsWith("done"), `body 在 ${text.length} 字节处被截断`);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("上游迟迟不返回响应头时按超时返回 502", async () => {
+  mock.method(console, "error", () => {});
+  const server = await listen(() => {
+    // 故意不响应
+  });
+
+  try {
+    globalThis.fetch = originalFetch;
+    const res = await worker.fetch(proxyRequest("/"), {
+      TARGET_ORIGIN: `http://127.0.0.1:${server.address().port}`,
+      UPSTREAM_TIMEOUT_MS: "100",
+    });
+
+    assert.equal(res.status, 502);
+  } finally {
+    await closeServer(server);
+  }
 });
