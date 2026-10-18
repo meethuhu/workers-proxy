@@ -1,5 +1,5 @@
 const DEFAULT_TARGET_ORIGIN = "https://spring.io";
-const UPSTREAM_TIMEOUT_MS = 25_000;
+const DEFAULT_TIMEOUT_MS = 25_000;
 
 const REQUEST_HEADERS_TO_DROP = [
   "cf-connecting-ip",
@@ -29,34 +29,39 @@ const HOP_BY_HOP_HEADERS = [
 // body 被改写后，这些头描述的已不再是实际内容
 const BODY_REWRITE_HEADERS_TO_DROP = ["content-length", "content-md5", "etag"];
 
+// 响应头里可能包含上游地址的字段，统一按替换表改写
+const REWRITTEN_RESPONSE_HEADERS = [
+  "location",
+  "content-location",
+  "link",
+  "refresh",
+  "content-security-policy",
+  "content-security-policy-report-only",
+  // 带 crossorigin 的 <script integrity> 会走 CORS 校验，
+  // 回显上游域名的 ACAO 会让这些资源被浏览器拒绝
+  "access-control-allow-origin",
+];
+
 export default {
   async fetch(request, env) {
-    let target;
+    let context;
+
     try {
-      target = resolveTarget(env);
+      context = createContext(request, env);
     } catch (error) {
-      console.error("TARGET_ORIGIN 配置无效", {
+      console.error("上游配置无效", {
         value: env?.TARGET_ORIGIN,
         error: error instanceof Error ? error.message : String(error),
       });
 
-      return new Response("500 Internal Server Error: 上游地址配置无效", {
-        status: 500,
-        headers: {
-          "content-type": "text/plain; charset=utf-8",
-        },
-      });
+      return textResponse("500 Internal Server Error: 上游地址配置无效", 500);
     }
 
-    const proxyUrl = new URL(request.url);
-    const upstreamUrl = new URL(request.url);
-    upstreamUrl.protocol = target.url.protocol;
-    upstreamUrl.hostname = target.url.hostname;
-    upstreamUrl.port = target.url.port;
+    const { upstreamUrl, timeoutMs } = context;
 
     const upstreamRequestInit = {
       method: request.method,
-      headers: buildUpstreamHeaders(request, proxyUrl, target),
+      headers: buildUpstreamHeaders(request, context),
       redirect: "manual",
     };
 
@@ -72,7 +77,7 @@ export default {
     const timeoutId = setTimeout(() => {
       timedOut = true;
       controller.abort();
-    }, target.timeoutMs);
+    }, timeoutMs);
 
     try {
       const response = await fetch(upstreamUrl, {
@@ -80,11 +85,12 @@ export default {
         signal: controller.signal,
       });
       clearTimeout(timeoutId);
-      const responseHeaders = buildResponseHeaders(response, proxyUrl, target);
+
+      const responseHeaders = buildResponseHeaders(response, context);
       const contentType = responseHeaders.get("content-type") || "";
 
       // 只有未压缩的 HTML 才能当文本改写。压缩过的 body 是二进制字节，
-      // 按文本逐字符处理会静默损坏内容，所以原样透传并保留 content-encoding。
+      // 按文本处理会静默损坏内容，所以原样透传并保留 content-encoding。
       if (
         isHtmlResponse(contentType) &&
         response.body &&
@@ -100,7 +106,7 @@ export default {
         responseHeaders.set("content-type", withUtf8Charset(contentType));
 
         return new Response(
-          rewriteHtmlBody(response.body, proxyUrl, target, getCharset(contentType)),
+          rewriteHtmlBody(response.body, context, getCharset(contentType)),
           {
             status: response.status,
             statusText: response.statusText,
@@ -117,7 +123,7 @@ export default {
     } catch (error) {
       clearTimeout(timeoutId);
 
-      // 详细原因只写日志，不回传客户端，避免泄漏上游地址与网络错误细节。
+      // 详细原因只写日志，不回传客户端，避免泄漏上游地址与网络错误细节
       console.error("上游请求失败", {
         url: upstreamUrl.href,
         method: request.method,
@@ -125,17 +131,33 @@ export default {
         error: error instanceof Error ? error.message : String(error),
       });
 
-      return new Response("502 Bad Gateway: 上游服务暂时不可用", {
-        status: 502,
-        headers: {
-          "content-type": "text/plain; charset=utf-8",
-        },
-      });
+      return textResponse("502 Bad Gateway: 上游服务暂时不可用", 502);
     }
   },
 };
 
-function resolveTarget(env) {
+// 每个请求只解析一次配置，后续函数共享同一份上下文，避免重复计算替换表
+function createContext(request, env) {
+  const upstream = resolveUpstream(env);
+  const proxyUrl = new URL(request.url);
+  const upstreamUrl = new URL(proxyUrl.href);
+
+  upstreamUrl.protocol = upstream.url.protocol;
+  upstreamUrl.hostname = upstream.url.hostname;
+  upstreamUrl.port = upstream.url.port;
+
+  const replacements = buildReplacements(proxyUrl, upstream);
+
+  return {
+    upstreamUrl,
+    upstream,
+    timeoutMs: resolveTimeout(env),
+    replacements,
+    reverseReplacements: invertReplacements(replacements),
+  };
+}
+
+function resolveUpstream(env) {
   const raw = env?.TARGET_ORIGIN || DEFAULT_TARGET_ORIGIN;
   const url = new URL(raw);
 
@@ -143,22 +165,29 @@ function resolveTarget(env) {
     throw new Error(`不支持的协议: ${url.protocol}`);
   }
 
-  // 可选：env.UPSTREAM_TIMEOUT_MS 覆盖等待响应头的超时（默认 25s）
-  const configured = Number(env?.UPSTREAM_TIMEOUT_MS);
-  const timeoutMs =
-    Number.isFinite(configured) && configured > 0 ? configured : UPSTREAM_TIMEOUT_MS;
+  // 只接受纯源地址。带路径或查询时会被静默丢弃，不如直接报错。
+  if (url.pathname !== "/" || url.search || url.hash) {
+    throw new Error("TARGET_ORIGIN 只能是源地址，不能包含路径、查询或片段");
+  }
 
-  return { url, origin: url.origin, host: url.host, timeoutMs };
+  return { url, origin: url.origin, host: url.host };
 }
 
-function buildUpstreamHeaders(request, proxyUrl, target) {
+function resolveTimeout(env) {
+  const configured = Number(env?.UPSTREAM_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_TIMEOUT_MS;
+}
+
+function buildUpstreamHeaders(request, context) {
+  const { upstream, reverseReplacements } = context;
   const headers = new Headers(request.headers);
 
   for (const header of [...REQUEST_HEADERS_TO_DROP, ...HOP_BY_HOP_HEADERS]) {
     headers.delete(header);
   }
 
-  headers.set("host", target.host);
+  // Host 由 upstreamUrl 决定，移除客户端带来的 Host，避免上游收到错误的主机名
+  headers.delete("host");
 
   // 只有可能返回 HTML 的请求才需要禁止压缩，因为 body 要按文本改写。
   // 其余请求（JS / CSS / 字体 / 图片）透传客户端的 accept-encoding，
@@ -169,12 +198,12 @@ function buildUpstreamHeaders(request, proxyUrl, target) {
 
   const referer = headers.get("referer");
   if (referer) {
-    headers.set("referer", rewriteProxyReferencesToTarget(referer, proxyUrl, target));
+    headers.set("referer", applyReplacements(referer, reverseReplacements));
   }
 
   const origin = headers.get("origin");
   if (origin) {
-    headers.set("origin", target.origin);
+    headers.set("origin", upstream.origin);
   }
 
   return headers;
@@ -192,36 +221,27 @@ function mayReturnHtml(request) {
   return accept.includes("text/html") || accept.includes("application/xhtml");
 }
 
-function buildResponseHeaders(response, proxyUrl, target) {
+function buildResponseHeaders(response, context) {
   const headers = new Headers(response.headers);
 
   for (const header of HOP_BY_HOP_HEADERS) {
     headers.delete(header);
   }
 
-  rewriteHeader(headers, "location", proxyUrl, target);
-  rewriteHeader(headers, "content-location", proxyUrl, target);
-  rewriteHeader(headers, "link", proxyUrl, target);
-  rewriteHeader(headers, "refresh", proxyUrl, target);
-  rewriteHeader(headers, "content-security-policy", proxyUrl, target);
-  rewriteHeader(headers, "content-security-policy-report-only", proxyUrl, target);
-  // 带 crossorigin 的 <script integrity> 会走 CORS 校验，
-  // 回显上游域名的 ACAO 会让这些资源被浏览器拒绝。
-  rewriteHeader(headers, "access-control-allow-origin", proxyUrl, target);
+  for (const name of REWRITTEN_RESPONSE_HEADERS) {
+    const value = headers.get(name);
+    if (value) {
+      headers.set(name, applyReplacements(value, context.replacements));
+    }
+  }
+
   rewriteSetCookieHeaders(response.headers, headers);
 
   return headers;
 }
 
-function rewriteHeader(headers, name, proxyUrl, target) {
-  const value = headers.get(name);
-  if (value) {
-    headers.set(name, rewriteTargetReferencesToProxy(value, proxyUrl, target));
-  }
-}
-
 function rewriteSetCookieHeaders(sourceHeaders, responseHeaders) {
-  const cookies = getSetCookies(sourceHeaders);
+  const cookies = sourceHeaders.getSetCookie();
   responseHeaders.delete("set-cookie");
 
   for (const cookie of cookies) {
@@ -229,22 +249,9 @@ function rewriteSetCookieHeaders(sourceHeaders, responseHeaders) {
   }
 }
 
-function getSetCookies(headers) {
-  if (typeof headers.getSetCookie === "function") {
-    return headers.getSetCookie();
-  }
-
-  if (typeof headers.getAll === "function") {
-    return headers.getAll("set-cookie");
-  }
-
-  const cookie = headers.get("set-cookie");
-  return cookie ? [cookie] : [];
-}
-
 function rewriteSetCookie(cookie) {
-  // Drop Domain instead of adding the proxy host. This keeps cookies host-only
-  // and preserves __Host- cookies, which are invalid if Domain is present.
+  // 去掉 Domain 而不是换成代理域名：这样 cookie 变成 host-only，
+  // 同时保留 __Host- 前缀的语义（带 Domain 的 __Host- cookie 是非法的）。
   return cookie.replace(/;\s*domain=[^;]*/gi, "");
 }
 
@@ -272,7 +279,7 @@ function getCharset(contentType) {
 
 function withUtf8Charset(contentType) {
   const mediaType = contentType.split(";")[0].trim();
-  return `${mediaType || "text/html"}; charset=utf-8`;
+  return `${mediaType}; charset=utf-8`;
 }
 
 function createDecoder(charset) {
@@ -284,10 +291,10 @@ function createDecoder(charset) {
   }
 }
 
-function rewriteHtmlBody(body, proxyUrl, target, charset) {
+function rewriteHtmlBody(body, context, charset) {
   const decoder = createDecoder(charset);
   const encoder = new TextEncoder();
-  const rewriteChunk = createStreamingReferenceRewriter(proxyUrl, target);
+  const rewriteChunk = createStreamingReferenceRewriter(context);
   let carry = "";
 
   return body.pipeThrough(new TransformStream({
@@ -311,8 +318,8 @@ function rewriteHtmlBody(body, proxyUrl, target, charset) {
   }));
 }
 
-function createStreamingReferenceRewriter(proxyUrl, target) {
-  const replacements = getTargetToProxyReplacements(proxyUrl, target);
+function createStreamingReferenceRewriter(context) {
+  const { replacements } = context;
   const replacementByNeedle = new Map(replacements);
   const maxNeedleLength = Math.max(...replacements.map(([needle]) => needle.length));
 
@@ -353,46 +360,48 @@ function createStreamingReferenceRewriter(proxyUrl, target) {
   };
 }
 
-function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function escapeSlashes(value) {
-  return value.replaceAll("/", "\\/");
-}
-
-function rewriteTargetReferencesToProxy(value, proxyUrl, target) {
-  return getTargetToProxyReplacements(proxyUrl, target).reduce(
+function applyReplacements(value, replacements) {
+  return replacements.reduce(
     (rewritten, [needle, replacement]) => rewritten.replaceAll(needle, replacement),
     value,
   );
 }
 
-function getTargetToProxyReplacements(proxyUrl, target) {
+function buildReplacements(proxyUrl, upstream) {
   const proxyOrigin = proxyUrl.origin;
   const proxyHost = proxyUrl.host;
 
   const replacements = [
-    [target.origin, proxyOrigin],
-    [`http://${target.host}`, proxyOrigin],
-    [`//${target.host}`, `//${proxyHost}`],
+    [upstream.origin, proxyOrigin],
+    [`http://${upstream.host}`, proxyOrigin],
+    [`//${upstream.host}`, `//${proxyHost}`],
     // 页面内联的 JSON / JS 常把斜杠转义成 \/，不处理会导致这些地址漏改
-    [escapeSlashes(target.origin), escapeSlashes(proxyOrigin)],
-    [`http:\\/\\/${target.host}`, escapeSlashes(proxyOrigin)],
-    [`\\/\\/${target.host}`, `\\/\\/${proxyHost}`],
+    [escapeJsonSlashes(upstream.origin), escapeJsonSlashes(proxyOrigin)],
+    [`http:\\/\\/${upstream.host}`, escapeJsonSlashes(proxyOrigin)],
+    [`\\/\\/${upstream.host}`, `\\/\\/${proxyHost}`],
   ];
 
   // 长 needle 优先，保证 https://host 不会被 //host 抢先匹配
   return replacements.sort((a, b) => b[0].length - a[0].length);
 }
 
-function rewriteProxyReferencesToTarget(value, proxyUrl, target) {
-  const replacements = getTargetToProxyReplacements(proxyUrl, target)
+function invertReplacements(replacements) {
+  return replacements
     .map(([needle, replacement]) => [replacement, needle])
     .sort((a, b) => b[0].length - a[0].length);
+}
 
-  return replacements.reduce(
-    (rewritten, [needle, replacement]) => rewritten.replaceAll(needle, replacement),
-    value,
-  );
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function escapeJsonSlashes(value) {
+  return value.replaceAll("/", "\\/");
+}
+
+function textResponse(message, status) {
+  return new Response(message, {
+    status,
+    headers: { "content-type": "text/plain; charset=utf-8" },
+  });
 }

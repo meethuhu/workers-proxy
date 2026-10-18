@@ -345,3 +345,64 @@ test("上游迟迟不返回响应头时按超时返回 502", async () => {
     await closeServer(server);
   }
 });
+
+test("Set-Cookie 去除 Domain，并保留多条 cookie 与 __Host- 前缀", async () => {
+  mockUpstream(
+    () =>
+      new Response("ok", {
+        headers: [
+          ["content-type", "text/plain"],
+          ["set-cookie", "sid=abc; Domain=spring.io; Path=/; Secure"],
+          ["set-cookie", "__Host-token=xyz; Path=/; Secure"],
+        ],
+      }),
+  );
+
+  const res = await worker.fetch(proxyRequest("/"), {});
+  const cookies = res.headers.getSetCookie();
+
+  assert.equal(cookies.length, 2, "多条 Set-Cookie 未全部保留");
+  assert.equal(cookies[0], "sid=abc; Path=/; Secure");
+  assert.equal(cookies[1], "__Host-token=xyz; Path=/; Secure", "__Host- cookie 被破坏");
+});
+
+test("重定向的 Location 改写为代理地址，相对路径保持不变", async () => {
+  mockUpstream(
+    () =>
+      new Response(null, {
+        status: 302,
+        headers: { location: `${UPSTREAM_ORIGIN}/login` },
+      }),
+  );
+
+  const absolute = await worker.fetch(proxyRequest("/private"), {});
+  assert.equal(absolute.status, 302);
+  assert.equal(absolute.headers.get("location"), `${PROXY_ORIGIN}/login`);
+
+  mockUpstream(
+    () => new Response(null, { status: 302, headers: { location: "/login" } }),
+  );
+
+  const relative = await worker.fetch(proxyRequest("/private"), {});
+  assert.equal(relative.headers.get("location"), "/login");
+});
+
+test("转发请求时把 Referer 改回上游地址", async () => {
+  mockUpstream(() => htmlResponse("<p>ok</p>"));
+
+  await worker.fetch(proxyRequest("/a", { referer: `${PROXY_ORIGIN}/from` }), {});
+
+  assert.equal(captured.init.headers.get("referer"), `${UPSTREAM_ORIGIN}/from`);
+});
+
+test("TARGET_ORIGIN 含路径时返回 500 且不发起请求", async () => {
+  mock.method(console, "error", () => {});
+  mockUpstream(() => htmlResponse("<p>ok</p>"));
+
+  const res = await worker.fetch(proxyRequest("/"), {
+    TARGET_ORIGIN: "https://example.com/base",
+  });
+
+  assert.equal(res.status, 500);
+  assert.equal(captured, undefined, "配置非法时仍然发起了上游请求");
+});
