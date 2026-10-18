@@ -1,0 +1,29 @@
+# 依赖
+node_modules/
+
+# Wrangler 本地状态与密钥（.dev.vars 含明文密钥，绝不能提交）
+.wrangler/
+.dev.vars
+.env
+.env.*
+!.env.example
+
+# 构建产物
+dist/
+build/
+
+# 本地 Agent / 工具缓存
+.workbuddy/
+
+# 日志
+*.log
+npm-debug.log*
+yarn-error.log*
+
+# 操作系统 / 编辑器
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
