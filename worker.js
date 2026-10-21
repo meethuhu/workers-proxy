@@ -1,7 +1,10 @@
 // 下面三个都是兜底值，优先级低于同名环境变量。
 // 取值顺序：env.X（来自 wrangler.jsonc 的 vars、Dashboard 变量或 --var）→ 这里的常量。
 // 只要部署时配置了对应变量，这里的值就不会生效。
-const DEFAULT_TARGET_ORIGIN = "https://spring.io";
+//
+// DEFAULT_TARGET_ORIGIN 默认留空，表示必须显式配置：部署时用 --var 或环境变量提供，
+// 也可以直接在这里写上源站地址。为空时请求直接返回 500，而不是静默指向某个默认站点。
+const DEFAULT_TARGET_ORIGIN = "";
 const DEFAULT_ENTRY_PATH = ""; // 留空表示不启用根路径跳转
 const DEFAULT_TIMEOUT_MS = 25_000;
 
@@ -58,7 +61,7 @@ export default {
         error: error instanceof Error ? error.message : String(error),
       });
 
-      return textResponse("500 Internal Server Error: 上游地址配置无效", 500);
+      return textResponse("500 Internal Server Error: 代理配置无效，请检查 TARGET_ORIGIN 与 ENTRY_PATH", 500);
     }
 
     // 根路径跳转到入口页面，让使用者只需记住域名。
@@ -178,6 +181,11 @@ function createContext(request, env) {
 
 function resolveUpstream(env) {
   const raw = env?.TARGET_ORIGIN || DEFAULT_TARGET_ORIGIN;
+
+  if (!raw) {
+    throw new Error("未配置 TARGET_ORIGIN");
+  }
+
   const url = new URL(raw);
 
   if (url.protocol !== "http:" && url.protocol !== "https:") {

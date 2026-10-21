@@ -7,11 +7,10 @@
   // 导致同一份代码在不同时间部署表现出不同语义。
   "compatibility_date": "2026-10-01",
 
-  // 上游地址放在 vars 里，改目标只需改配置并重新部署，不必动代码。
-  // 代码中未配置时回退到 worker.js 内的 DEFAULT_TARGET_ORIGIN。
-  "vars": {
-    "TARGET_ORIGIN": "https://spring.io"
-  },
+  // 上游地址不在仓库里配置，部署时通过 --var 注入：
+  //   wrangler deploy --var TARGET_ORIGIN:https://example.com
+  // 也可以直接在 worker.js 的 DEFAULT_TARGET_ORIGIN 里填写。
+  // 两者都没配时，请求会返回 500，而不是静默指向某个默认站点。
 
   // 打开后可对 console.error 产生的日志做检索，便于排查 502。
   "observability": {

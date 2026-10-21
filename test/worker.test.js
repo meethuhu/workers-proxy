@@ -9,6 +9,11 @@ const PROXY_HOST = "proxy.example.workers.dev";
 const UPSTREAM_ORIGIN = "https://spring.io";
 const UPSTREAM_HOST = "spring.io";
 
+// 测试默认都显式提供上游地址：代码里不再有内置兜底值
+function env(overrides = {}) {
+  return { TARGET_ORIGIN: UPSTREAM_ORIGIN, ...overrides };
+}
+
 const originalFetch = globalThis.fetch;
 let captured;
 
@@ -63,7 +68,7 @@ test("改写绝对地址与协议相对地址，并移除 content-length", async
     ),
   );
 
-  const res = await worker.fetch(proxyRequest("/pay"), {});
+  const res = await worker.fetch(proxyRequest("/pay"), env());
   const text = await res.text();
 
   assert.ok(text.includes(`${PROXY_ORIGIN}/pay`), "绝对地址未改写");
@@ -75,7 +80,7 @@ test("改写内联 JSON 中转义斜杠的地址", async () => {
   const html = `<script>var u="https:\\/\\/${UPSTREAM_HOST}\\/api";</script>`;
   mockUpstream(() => htmlResponse(html));
 
-  const res = await worker.fetch(proxyRequest("/"), {});
+  const res = await worker.fetch(proxyRequest("/"), env());
   const text = await res.text();
 
   assert.ok(
@@ -101,7 +106,7 @@ test("任意 chunk 切分下改写结果一致", async () => {
         }),
     );
 
-    const res = await worker.fetch(proxyRequest("/"), {});
+    const res = await worker.fetch(proxyRequest("/"), env());
     assert.equal(await res.text(), expected, `chunkSize=${size} 时结果不一致`);
   }
 });
@@ -116,7 +121,7 @@ test("按响应声明的字符集解码，并统一输出 UTF-8", async () => {
     () => new Response(bytes, { headers: { "content-type": "text/html; charset=gbk" } }),
   );
 
-  const res = await worker.fetch(proxyRequest("/"), {});
+  const res = await worker.fetch(proxyRequest("/"), env());
   const text = await res.text();
 
   assert.ok(text.includes("中文"), "GBK 内容被解码成乱码");
@@ -133,7 +138,7 @@ test("压缩响应原样透传，不当作文本改写", async () => {
       }),
   );
 
-  const res = await worker.fetch(proxyRequest("/"), {});
+  const res = await worker.fetch(proxyRequest("/"), env());
   const body = Buffer.from(await res.arrayBuffer());
 
   assert.deepEqual(body, gzipped, "压缩 body 被改动");
@@ -144,21 +149,21 @@ test("文档请求禁用压缩，静态资源透传 accept-encoding", async () =
   mockUpstream(() => htmlResponse("<p>ok</p>"));
   await worker.fetch(
     proxyRequest("/", { "sec-fetch-dest": "document", accept: "text/html" }),
-    {},
+    env(),
   );
   assert.equal(captured.init.headers.get("accept-encoding"), "identity");
 
   mockUpstream(() => new Response("body{}", { headers: { "content-type": "text/css" } }));
   await worker.fetch(
     proxyRequest("/a.css", { "sec-fetch-dest": "style", "accept-encoding": "gzip, br" }),
-    {},
+    env(),
   );
   assert.equal(captured.init.headers.get("accept-encoding"), "gzip, br");
 });
 
 test("没有 Sec-Fetch-Dest 时按 Accept 判断是否需要改写", async () => {
   mockUpstream(() => htmlResponse("<p>ok</p>"));
-  await worker.fetch(proxyRequest("/", { accept: "text/html,application/xhtml+xml" }), {});
+  await worker.fetch(proxyRequest("/", { accept: "text/html,application/xhtml+xml" }), env());
   assert.equal(captured.init.headers.get("accept-encoding"), "identity");
 });
 
@@ -173,7 +178,7 @@ test("回显上游域名的 access-control-allow-origin 会被改写", async () 
       }),
   );
 
-  const res = await worker.fetch(proxyRequest("/"), {});
+  const res = await worker.fetch(proxyRequest("/"), env());
   assert.equal(res.headers.get("access-control-allow-origin"), PROXY_ORIGIN);
 });
 
@@ -185,7 +190,7 @@ test("通配符 access-control-allow-origin 保持不变", async () => {
       }),
   );
 
-  const res = await worker.fetch(proxyRequest("/"), {});
+  const res = await worker.fetch(proxyRequest("/"), env());
   assert.equal(res.headers.get("access-control-allow-origin"), "*");
 });
 
@@ -197,7 +202,7 @@ test("非 HTML 响应不被改写", async () => {
       }),
   );
 
-  const res = await worker.fetch(proxyRequest("/api"), {});
+  const res = await worker.fetch(proxyRequest("/api"), env());
   assert.ok((await res.text()).includes(UPSTREAM_ORIGIN));
 });
 
@@ -207,7 +212,7 @@ test("上游异常时返回 502 且不泄漏内部细节", async () => {
     throw new Error("connect ECONNREFUSED 10.0.0.5:443");
   });
 
-  const res = await worker.fetch(proxyRequest("/"), {});
+  const res = await worker.fetch(proxyRequest("/"), env());
   const text = await res.text();
 
   assert.equal(res.status, 502);
@@ -225,7 +230,17 @@ test("TARGET_ORIGIN 非法时返回 500 且不发起上游请求", async () => {
   assert.equal(captured, undefined, "配置非法时仍然发起了上游请求");
 });
 
-test("env.TARGET_ORIGIN 覆盖默认上游", async () => {
+test("未配置 TARGET_ORIGIN 时返回 500", async () => {
+  mock.method(console, "error", () => {});
+  mockUpstream(() => htmlResponse("<p>ok</p>"));
+
+  const res = await worker.fetch(proxyRequest("/"), {});
+
+  assert.equal(res.status, 500);
+  assert.equal(captured, undefined, "未配置上游时不应发起请求");
+});
+
+test("env.TARGET_ORIGIN 决定上游地址", async () => {
   mockUpstream(() => htmlResponse(`<a href="https://other.example.com/x">y</a>`));
 
   const res = await worker.fetch(proxyRequest("/"), {
@@ -250,7 +265,7 @@ test("206 分段响应不做 HTML 改写", async () => {
       }),
   );
 
-  const res = await worker.fetch(proxyRequest("/", { range: "bytes=0-24" }), {});
+  const res = await worker.fetch(proxyRequest("/", { range: "bytes=0-24" }), env());
 
   assert.equal(res.status, 206);
   assert.equal(await res.text(), partial, "分段响应被改写了");
@@ -269,7 +284,7 @@ test("大体积二进制响应逐字节透传", async () => {
       }),
   );
 
-  const res = await worker.fetch(proxyRequest("/download.bin"), {});
+  const res = await worker.fetch(proxyRequest("/download.bin"), env());
   const body = new Uint8Array(await res.arrayBuffer());
 
   assert.equal(body.length, bytes.length);
@@ -283,7 +298,7 @@ test("拿到响应头后清除超时计时器，避免中断仍在传输的 body
   const originalClear = globalThis.clearTimeout;
   const spy = mock.method(globalThis, "clearTimeout", (id) => originalClear(id));
 
-  await worker.fetch(proxyRequest("/"), {});
+  await worker.fetch(proxyRequest("/"), env());
 
   assert.ok(spy.mock.callCount() >= 1, "响应头返回后未清除超时计时器");
 });
@@ -358,7 +373,7 @@ test("Set-Cookie 去除 Domain，并保留多条 cookie 与 __Host- 前缀", asy
       }),
   );
 
-  const res = await worker.fetch(proxyRequest("/"), {});
+  const res = await worker.fetch(proxyRequest("/"), env());
   const cookies = res.headers.getSetCookie();
 
   assert.equal(cookies.length, 2, "多条 Set-Cookie 未全部保留");
@@ -375,7 +390,7 @@ test("重定向的 Location 改写为代理地址，相对路径保持不变", a
       }),
   );
 
-  const absolute = await worker.fetch(proxyRequest("/private"), {});
+  const absolute = await worker.fetch(proxyRequest("/private"), env());
   assert.equal(absolute.status, 302);
   assert.equal(absolute.headers.get("location"), `${PROXY_ORIGIN}/login`);
 
@@ -383,14 +398,14 @@ test("重定向的 Location 改写为代理地址，相对路径保持不变", a
     () => new Response(null, { status: 302, headers: { location: "/login" } }),
   );
 
-  const relative = await worker.fetch(proxyRequest("/private"), {});
+  const relative = await worker.fetch(proxyRequest("/private"), env());
   assert.equal(relative.headers.get("location"), "/login");
 });
 
 test("转发请求时把 Referer 改回上游地址", async () => {
   mockUpstream(() => htmlResponse("<p>ok</p>"));
 
-  await worker.fetch(proxyRequest("/a", { referer: `${PROXY_ORIGIN}/from` }), {});
+  await worker.fetch(proxyRequest("/a", { referer: `${PROXY_ORIGIN}/from` }), env());
 
   assert.equal(captured.init.headers.get("referer"), `${UPSTREAM_ORIGIN}/from`);
 });
@@ -410,7 +425,7 @@ test("TARGET_ORIGIN 含路径时返回 500 且不发起请求", async () => {
 test("设置 ENTRY_PATH 时根路径跳转到入口", async () => {
   mockUpstream(() => htmlResponse("<p>ok</p>"));
 
-  const res = await worker.fetch(proxyRequest("/"), { ENTRY_PATH: "/i/abc123" });
+  const res = await worker.fetch(proxyRequest("/"), env({ ENTRY_PATH: "/i/abc123" }));
 
   assert.equal(res.status, 302);
   assert.equal(res.headers.get("location"), "/i/abc123");
@@ -420,7 +435,7 @@ test("设置 ENTRY_PATH 时根路径跳转到入口", async () => {
 test("跳转时保留查询字符串", async () => {
   mockUpstream(() => htmlResponse("<p>ok</p>"));
 
-  const res = await worker.fetch(proxyRequest("/?a=1&b=2"), { ENTRY_PATH: "/i/abc123" });
+  const res = await worker.fetch(proxyRequest("/?a=1&b=2"), env({ ENTRY_PATH: "/i/abc123" }));
 
   assert.equal(res.headers.get("location"), "/i/abc123?a=1&b=2");
 });
@@ -428,7 +443,7 @@ test("跳转时保留查询字符串", async () => {
 test("ENTRY_PATH 只影响根路径", async () => {
   mockUpstream(() => htmlResponse("<p>ok</p>"));
 
-  const res = await worker.fetch(proxyRequest("/app.js"), { ENTRY_PATH: "/i/abc123" });
+  const res = await worker.fetch(proxyRequest("/app.js"), env({ ENTRY_PATH: "/i/abc123" }));
 
   assert.equal(res.status, 200);
   assert.equal(captured.url, `${UPSTREAM_ORIGIN}/app.js`, "非根路径不应被改写");
@@ -442,7 +457,7 @@ test("POST 到根路径不跳转", async () => {
     body: "x",
     headers: { "sec-fetch-dest": "empty" },
   });
-  await worker.fetch(request, { ENTRY_PATH: "/i/abc123" });
+  await worker.fetch(request, env({ ENTRY_PATH: "/i/abc123" }));
 
   assert.ok(captured, "POST 应该正常转发而不是跳转");
 });
@@ -452,7 +467,7 @@ test("ENTRY_PATH 必须以单个 / 开头，否则返回 500", async () => {
   mockUpstream(() => htmlResponse("<p>ok</p>"));
 
   for (const value of ["i/abc", "https://example.com/x", "/", "//evil.example"]) {
-    const res = await worker.fetch(proxyRequest("/"), { ENTRY_PATH: value });
+    const res = await worker.fetch(proxyRequest("/"), env({ ENTRY_PATH: value }));
     assert.equal(res.status, 500, `ENTRY_PATH=${value} 应被拒绝`);
   }
 });
