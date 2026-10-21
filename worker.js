@@ -1,4 +1,8 @@
+// 下面三个都是兜底值，优先级低于同名环境变量。
+// 取值顺序：env.X（来自 wrangler.jsonc 的 vars、Dashboard 变量或 --var）→ 这里的常量。
+// 只要部署时配置了对应变量，这里的值就不会生效。
 const DEFAULT_TARGET_ORIGIN = "https://spring.io";
+const DEFAULT_ENTRY_PATH = ""; // 留空表示不启用根路径跳转
 const DEFAULT_TIMEOUT_MS = 25_000;
 
 const REQUEST_HEADERS_TO_DROP = [
@@ -194,7 +198,7 @@ function resolveTimeout(env) {
 }
 
 function resolveEntryPath(env) {
-  const raw = env?.ENTRY_PATH;
+  const raw = env?.ENTRY_PATH || DEFAULT_ENTRY_PATH;
   if (!raw) {
     return null;
   }
