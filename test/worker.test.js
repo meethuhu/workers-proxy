@@ -406,3 +406,53 @@ test("TARGET_ORIGIN 含路径时返回 500 且不发起请求", async () => {
   assert.equal(res.status, 500);
   assert.equal(captured, undefined, "配置非法时仍然发起了上游请求");
 });
+
+test("设置 ENTRY_PATH 时根路径跳转到入口", async () => {
+  mockUpstream(() => htmlResponse("<p>ok</p>"));
+
+  const res = await worker.fetch(proxyRequest("/"), { ENTRY_PATH: "/i/abc123" });
+
+  assert.equal(res.status, 302);
+  assert.equal(res.headers.get("location"), "/i/abc123");
+  assert.equal(captured, undefined, "跳转时不应请求上游");
+});
+
+test("跳转时保留查询字符串", async () => {
+  mockUpstream(() => htmlResponse("<p>ok</p>"));
+
+  const res = await worker.fetch(proxyRequest("/?a=1&b=2"), { ENTRY_PATH: "/i/abc123" });
+
+  assert.equal(res.headers.get("location"), "/i/abc123?a=1&b=2");
+});
+
+test("ENTRY_PATH 只影响根路径", async () => {
+  mockUpstream(() => htmlResponse("<p>ok</p>"));
+
+  const res = await worker.fetch(proxyRequest("/app.js"), { ENTRY_PATH: "/i/abc123" });
+
+  assert.equal(res.status, 200);
+  assert.equal(captured.url, `${UPSTREAM_ORIGIN}/app.js`, "非根路径不应被改写");
+});
+
+test("POST 到根路径不跳转", async () => {
+  mockUpstream(() => htmlResponse("<p>ok</p>"));
+
+  const request = new Request(`${PROXY_ORIGIN}/`, {
+    method: "POST",
+    body: "x",
+    headers: { "sec-fetch-dest": "empty" },
+  });
+  await worker.fetch(request, { ENTRY_PATH: "/i/abc123" });
+
+  assert.ok(captured, "POST 应该正常转发而不是跳转");
+});
+
+test("ENTRY_PATH 必须以单个 / 开头，否则返回 500", async () => {
+  mock.method(console, "error", () => {});
+  mockUpstream(() => htmlResponse("<p>ok</p>"));
+
+  for (const value of ["i/abc", "https://example.com/x", "/", "//evil.example"]) {
+    const res = await worker.fetch(proxyRequest("/"), { ENTRY_PATH: value });
+    assert.equal(res.status, 500, `ENTRY_PATH=${value} 应被拒绝`);
+  }
+});

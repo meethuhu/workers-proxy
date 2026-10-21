@@ -57,6 +57,19 @@ export default {
       return textResponse("500 Internal Server Error: 上游地址配置无效", 500);
     }
 
+    // 根路径跳转到入口页面，让使用者只需记住域名。
+    // 用 302 而不是 301：入口路径可能变，避免浏览器长期缓存旧目标。
+    if (
+      context.entryPath &&
+      context.proxyUrl.pathname === "/" &&
+      (request.method === "GET" || request.method === "HEAD")
+    ) {
+      return new Response(null, {
+        status: 302,
+        headers: { location: `${context.entryPath}${context.proxyUrl.search}` },
+      });
+    }
+
     const { upstreamUrl, timeoutMs } = context;
 
     const upstreamRequestInit = {
@@ -149,9 +162,11 @@ function createContext(request, env) {
   const replacements = buildReplacements(proxyUrl, upstream);
 
   return {
+    proxyUrl,
     upstreamUrl,
     upstream,
     timeoutMs: resolveTimeout(env),
+    entryPath: resolveEntryPath(env),
     replacements,
     reverseReplacements: invertReplacements(replacements),
   };
@@ -176,6 +191,21 @@ function resolveUpstream(env) {
 function resolveTimeout(env) {
   const configured = Number(env?.UPSTREAM_TIMEOUT_MS);
   return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_TIMEOUT_MS;
+}
+
+function resolveEntryPath(env) {
+  const raw = env?.ENTRY_PATH;
+  if (!raw) {
+    return null;
+  }
+
+  // 必须是站内路径：//host 会被浏览器当成协议相对地址，形成开放重定向；
+  // 单独的 / 会导致跳转到自身，形成死循环。
+  if (!raw.startsWith("/") || raw.startsWith("//") || raw === "/") {
+    throw new Error("ENTRY_PATH 必须是以单个 / 开头的站内路径，且不能是根路径");
+  }
+
+  return raw;
 }
 
 function buildUpstreamHeaders(request, context) {
